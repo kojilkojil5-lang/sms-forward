@@ -69,11 +69,11 @@ public class MainActivity extends Activity {
         swEnabled.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
         root.addView(swEnabled);
 
-        etTarget = addField(root, "받을 사람 번호 (필수)", "예: 010-1234-5678", InputType.TYPE_CLASS_PHONE);
+        etTarget = addField(root, "받을 사람 번호 (필수, 여러 명은 쉼표로 구분)", "예: 010-1234-5678, 010-2222-3333", InputType.TYPE_CLASS_PHONE);
         etSenders = addField(root, "이 번호에서 온 문자만 전달 (비우면 전체)",
                 "쉼표로 구분. 예: 1588-1234, 010-9876-5432", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         etInclude = addField(root, "이 단어가 들어간 문자만 전달 (비우면 전체)",
-                "쉼표로 구분. 예: 예약, 입금", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+                "쉼표로 구분. 띄어 쓴 단어는 모두 포함돼야 함. 예: 신세계 OTP, 입금", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         etExclude = addField(root, "이 단어가 들어가면 전달 안 함",
                 "쉼표로 구분", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
 
@@ -142,8 +142,8 @@ public class MainActivity extends Activity {
         String target = etTarget.getText().toString().trim();
         boolean enabled = swEnabled.isChecked();
 
-        if (enabled && Forwarder.digits(target).length() < 9) {
-            toast("받을 사람 번호를 정확히 입력하세요");
+        if (enabled && !validTargets(target)) {
+            toast("받을 사람 번호를 정확히 입력하세요 (여러 명은 쉼표로 구분)");
             return;
         }
         if (enabled && !hasSmsPermission()) {
@@ -234,8 +234,8 @@ public class MainActivity extends Activity {
 
     private void sendTest() {
         String target = etTarget.getText().toString().trim();
-        if (Forwarder.digits(target).length() < 9) {
-            toast("받을 사람 번호를 먼저 입력하세요");
+        if (!validTargets(target)) {
+            toast("받을 사람 번호를 정확히 입력하세요 (여러 명은 쉼표로 구분)");
             return;
         }
         if (!hasSmsPermission()) {
@@ -243,19 +243,23 @@ public class MainActivity extends Activity {
             return;
         }
         new AlertDialog.Builder(this)
-                .setMessage(target + " 번호로 테스트 문자 1통을 실제로 보냅니다.")
+                .setMessage(Forwarder.split(target).length + "명에게 테스트 문자를 1통씩 실제로 보냅니다.\n" + target)
                 .setPositiveButton("보내기", (d, w) -> {
-                    try {
-                        Forwarder.send(this, target, "[문자전달 테스트] 자동전달 앱 연결 확인용 문자입니다.");
-                        Forwarder.log(this, "테스트 문자 보냄 → " + target);
-                        toast("보냈습니다");
-                    } catch (Exception e) {
-                        toast("전송 실패: " + e.getMessage());
-                    }
+                    Forwarder.sendToAll(this, Forwarder.split(target),
+                            "[문자전달 테스트] 자동전달 앱 연결 확인용 문자입니다.", "테스트");
+                    toast("보냈습니다. 받는 분들께 도착했는지 확인하세요");
                     refreshStatus();
                 })
                 .setNegativeButton("취소", null)
                 .show();
+    }
+
+    /** 쉼표로 구분된 번호가 1개 이상이고 모두 9자리 이상인지 */
+    private boolean validTargets(String raw) {
+        String[] arr = Forwarder.split(raw);
+        if (arr.length == 0) return false;
+        for (String t : arr) if (Forwarder.digits(t).length() < 9) return false;
+        return true;
     }
 
     private void toast(String s) {

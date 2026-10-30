@@ -1,6 +1,8 @@
 package kr.smsforward.app;
 
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.telephony.SmsManager;
@@ -24,7 +26,7 @@ public final class Forwarder {
     /** 처음 설치 시 기본 제외어: 인증번호 류는 전달하지 않음 */
     static final String DEFAULT_EXCLUDE = "인증번호,인증 번호,OTP,비밀번호,승인번호,보안코드";
 
-    private static final int MAX_LOG_LINES = 50;
+    private static final int MAX_LOG_LINES = 100;
 
     private Forwarder() {}
 
@@ -37,19 +39,20 @@ public final class Forwarder {
         SharedPreferences p = prefs(c);
         if (!p.getBoolean(KEY_ENABLED, false)) return;
 
-        String target = p.getString(KEY_TARGET, "").trim();
-        if (digits(target).isEmpty()) {
+        String[] targets = split(p.getString(KEY_TARGET, ""));
+        if (targets.length == 0) {
             log(c, "건너뜀(받을 번호 미설정) - " + from);
             return;
         }
 
         String fromDigits = digits(from);
-        String targetDigits = digits(target);
 
-        // 받는 사람이 보낸 문자를 다시 그 사람에게 돌려보내는 무한반복 방지
-        if (!fromDigits.isEmpty() && sameNumber(fromDigits, targetDigits)) {
-            log(c, "건너뜀(받는 사람 본인 문자) - " + from);
-            return;
+        // 받는 사람이 보낸 문자를 다시 돌려보내는 무한반복 방지
+        for (String t : targets) {
+            if (!fromDigits.isEmpty() && sameNumber(fromDigits, digits(t))) {
+                log(c, "건너뜀(받는 사람 본인 문자) - " + from);
+                return;
+            }
         }
 
         // 1) 발신번호 필터: 비어 있으면 모든 번호 허용
@@ -67,7 +70,7 @@ public final class Forwarder {
 
         // 2) 제외어: 하나라도 들어 있으면 전달 안 함
         for (String ex : split(p.getString(KEY_EXCLUDE, DEFAULT_EXCLUDE))) {
-            if (lowerBody.contains(ex.toLowerCase(Locale.ROOT))) {
+            if (matches(lowerBody, ex)) {
                 log(c, "제외어(" + ex + ") 포함으로 미전달 - " + from);
                 return;
             }
@@ -78,22 +81,55 @@ public final class Forwarder {
         if (includes.length > 0) {
             boolean ok = false;
             for (String in : includes) {
-                if (lowerBody.contains(in.toLowerCase(Locale.ROOT))) { ok = true; break; }
+                if (matches(lowerBody, in)) { ok = true; break; }
             }
             if (!ok) return;
         }
 
         String text = "[문자전달] 보낸사람: " + from + "\n" + body;
-        try {
-            send(c, target, text);
-            log(c, "전달함 " + from + " → " + target);
-        } catch (Exception e) {
-            log(c, "전송 실패 " + from + " : " + e.getMessage());
+        sendToAll(c, targets, text, "전달 " + from);
+    }
+
+    /** 여러 명에게 각각 따로 발송하고 결과를 번호별로 기록 */
+    static void sendToAll(Context c, String[] targets, String text, String what) {
+        for (String t : targets) {
+            String num = digits(t);
+            if (num.length() < 9) {
+                log(c, what + " → " + t + " 실패(번호 형식 오류)");
+                continue;
+            }
+            try {
+                send(c, num, text, what);
+                log(c, "⏳ 발송 요청 [" + what + "] → " + num);
+            } catch (Exception e) {
+                log(c, "❌ 발송 실패 [" + what + "] → " + num + " : " + e.getMessage());
+            }
         }
     }
 
-    /** 실제 SMS 발송. 긴 내용은 여러 통으로 나눠 보냄 */
-    static void send(Context c, String to, String text) {
+    /**
+     * 키워드 판단. 띄어쓰기로 나뉜 단어가 모두 들어 있으면 일치로 봄.
+     * 예) "신세계 OTP" → 문자에 '신세계'와 'OTP'가 둘 다 있으면 일치 (붙어 있지 않아도 됨)
+     */
+    static boolean matches(String lowerBody, String keyword) {
+        String[] words = keyword.trim().toLowerCase(Locale.ROOT).split("\\s+");
+        boolean any = false;
+        for (String w : words) {
+            if (w.isEmpty()) continue;
+            any = true;
+            if (!lowerBody.contains(w)) return false;
+        }
+        return any;
+    }
+
+    private static int reqCode = (int) (System.currentTimeMillis() & 0xFFFFF);
+
+    /**
+     * 실제 SMS 발송. 긴 내용은 여러 통으로 나눠 보냄.
+     * 발송 결과(통신사로 나갔는지)와 수신 확인(상대 폰 도착)을 SendResultReceiver 가 기록함.
+     * 여러 통으로 나뉜 경우 마지막 조각 기준으로 한 번만 기록.
+     */
+    static void send(Context c, String to, String text, String what) {
         SmsManager sm;
         if (Build.VERSION.SDK_INT >= 31) {
             sm = c.getSystemService(SmsManager.class);
@@ -101,11 +137,34 @@ public final class Forwarder {
             sm = SmsManager.getDefault();
         }
         ArrayList<String> parts = sm.divideMessage(text);
-        if (parts.size() > 1) {
-            sm.sendMultipartTextMessage(to, null, parts, null, null);
+        int n = parts.size();
+        PendingIntent sentLast = resultIntent(c, SendResultReceiver.ACTION_SENT, to, what, n);
+        PendingIntent deliveredLast = resultIntent(c, SendResultReceiver.ACTION_DELIVERED, to, what, n);
+
+        if (n > 1) {
+            ArrayList<PendingIntent> sent = new ArrayList<>();
+            ArrayList<PendingIntent> delivered = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                sent.add(i == n - 1 ? sentLast : null);
+                delivered.add(i == n - 1 ? deliveredLast : null);
+            }
+            sm.sendMultipartTextMessage(to, null, parts, sent, delivered);
         } else {
-            sm.sendTextMessage(to, null, text, null, null);
+            sm.sendTextMessage(to, null, text, sentLast, deliveredLast);
         }
+    }
+
+    private static synchronized PendingIntent resultIntent(Context c, String action, String to, String what, int parts) {
+        Intent i = new Intent(c, SendResultReceiver.class);
+        i.setAction(action);
+        i.putExtra(SendResultReceiver.EXTRA_TO, to);
+        i.putExtra(SendResultReceiver.EXTRA_WHAT, what);
+        i.putExtra(SendResultReceiver.EXTRA_PARTS, parts);
+        reqCode++;
+        // 결과 코드를 시스템이 채워줘야 하므로 MUTABLE 필요 (명시적 대상이라 안전)
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+        return PendingIntent.getBroadcast(c, reqCode, i, flags);
     }
 
     static synchronized void log(Context c, String line) {
