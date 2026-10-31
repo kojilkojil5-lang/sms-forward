@@ -136,7 +136,8 @@ public final class Forwarder {
         } else {
             sm = SmsManager.getDefault();
         }
-        ArrayList<String> parts = sm.divideMessage(text);
+        // divideMessage()는 삼성 등에서 READ_PHONE_STATE 권한을 요구하며 실패하므로 직접 나눔
+        ArrayList<String> parts = splitMessage(text);
         int n = parts.size();
         PendingIntent sentLast = resultIntent(c, SendResultReceiver.ACTION_SENT, to, what, n);
         PendingIntent deliveredLast = resultIntent(c, SendResultReceiver.ACTION_DELIVERED, to, what, n);
@@ -148,10 +149,49 @@ public final class Forwarder {
                 sent.add(i == n - 1 ? sentLast : null);
                 delivered.add(i == n - 1 ? deliveredLast : null);
             }
-            sm.sendMultipartTextMessage(to, null, parts, sent, delivered);
+            try {
+                sm.sendMultipartTextMessage(to, null, parts, sent, delivered);
+            } catch (SecurityException e) {
+                // 그래도 막히면 조각을 한 통씩 따로 보냄 (결과 기록은 마지막 조각 기준)
+                for (int i = 0; i < n; i++) {
+                    sm.sendTextMessage(to, null, parts.get(i),
+                            i == n - 1 ? sentLast : null, i == n - 1 ? deliveredLast : null);
+                }
+            }
         } else {
             sm.sendTextMessage(to, null, text, sentLast, deliveredLast);
         }
+    }
+
+    /**
+     * 문자 나누기. 한글 등 포함 시 한 통 70자(분할 시 67자), 영문/숫자만이면 160자(분할 시 153자).
+     * 이모지 같은 두 칸짜리 글자가 중간에 잘리지 않게 처리.
+     */
+    static ArrayList<String> splitMessage(String text) {
+        boolean ascii = true;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch >= 128 || ch == '[' || ch == ']' || ch == '{' || ch == '}'
+                    || ch == '\\' || ch == '^' || ch == '~' || ch == '|' || ch == '`') {
+                ascii = false;
+                break;
+            }
+        }
+        int single = ascii ? 160 : 70;
+        int chunk = ascii ? 153 : 67;
+        ArrayList<String> out = new ArrayList<>();
+        if (text.length() <= single) {
+            out.add(text);
+            return out;
+        }
+        int i = 0;
+        while (i < text.length()) {
+            int end = Math.min(i + chunk, text.length());
+            if (end < text.length() && Character.isHighSurrogate(text.charAt(end - 1))) end--;
+            out.add(text.substring(i, end));
+            i = end;
+        }
+        return out;
     }
 
     private static synchronized PendingIntent resultIntent(Context c, String action, String to, String what, int parts) {
